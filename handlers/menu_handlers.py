@@ -32,6 +32,13 @@ async def handle_back(update, context):
     logging.info("Возврат в главное меню. Текущее query.message: %s", query.message if query else "None")
     await query.answer()
     chat_id = query.message.chat_id if query.message else update.effective_chat.id
+    message_id = query.message.message_id
+    # Удаление текущего сообщения с объявлением
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logging.info(f"Удалено сообщение с объявлением, Message ID: {message_id}")
+    except Exception as e:
+        logging.warning(f"Не удалось удалить сообщение {message_id}: {str(e)}")
 
     # Очистка и удаление предыдущих сообщений
     if 'message_ids' in context.user_data:

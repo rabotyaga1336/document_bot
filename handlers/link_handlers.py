@@ -4,7 +4,7 @@ from telegram.ext import ContextTypes, ConversationHandler, CallbackQueryHandler
 from database import db
 import logging
 
-from .menu_handlers import handle_back, start  # Используем handle_back
+from .menu_handlers import handle_back, start
 from .utils import is_url, category_map
 from config import ADMIN_IDS
 
@@ -53,7 +53,7 @@ async def handle_add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     try:
         message = await query.message.edit_text(
-            f"Отправьте ссылку как простой текст (например, https://example.com) и, опционально, описание как caption "
+            f"Отправьте ссылку как простой текст (например, https://example.com) и на следующей строке укажите Описание "
             f"для категории '{category_map.get(category)}'. Нажмите 'Завершить добавление', когда закончите. "
             f"Описание станет названием кнопки.",
             reply_markup=reply_markup)
@@ -106,6 +106,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 'message_ids' not in context.user_data:
             context.user_data['message_ids'] = []
         context.user_data['message_ids'].append(message.message_id)
+        # Очистка чата, сохраняя только последнее сообщение
+        current_message_id = message.message_id
+        if 'message_ids' in context.user_data and len(context.user_data['message_ids']) > 1:
+            for msg_id in context.user_data['message_ids'][:-1]:
+                try:
+                    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+                    logging.info(f"Удалено старое сообщение с ID: {msg_id}")
+                except Exception as e:
+                    logging.warning(f"Не удалось удалить сообщение {msg_id}: {str(e)}")
+            context.user_data['message_ids'] = [current_message_id]
     return STATE_ADDING_LINKS
 
 async def handle_done_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,7 +133,7 @@ async def handle_done_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.info(f"Удалено старое сообщение с ID: {msg_id}")
             except Exception as e:
                 logging.warning(f"Не удалось удалить сообщение {msg_id}: {str(e)}")
-        context.user_data['message_ids'] = []  # Очистка после удаления
+        context.user_data['message_ids'] = []
 
     if user_id not in ADMIN_IDS:
         await query.message.edit_text("У вас нет прав для выполнения этой операции.")
@@ -134,7 +144,8 @@ async def handle_done_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for url, description in context.user_data['link_data']:
             link_id = db.save_link(category, url, description)
             logging.info(f"Сохранена ссылка с ID {link_id}: {url}, категория: {category}")
-    del context.user_data['link_data']
+    if 'link_data' in context.user_data:
+        del context.user_data['link_data']
     # Возврат в главное меню
     await handle_back(update, context)
     return ConversationHandler.END
@@ -144,6 +155,23 @@ async def handle_delete_link_selection(update: Update, context: ContextTypes.DEF
     user_id = query.from_user.id
     logging.info(f"Выбор ссылки для удаления в категории: {context.user_data.get('current_category')} пользователем {user_id}")
     await query.answer()
+    chat_id = query.message.chat_id
+
+    # Сохранение текущего message_id перед очисткой
+    current_message_id = query.message.message_id
+    context.user_data['current_message_id'] = current_message_id
+
+    # Удаление предыдущих сообщений, кроме текущего
+    if 'message_ids' in context.user_data and context.user_data['message_ids']:
+        for msg_id in context.user_data['message_ids']:
+            if msg_id != current_message_id:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                    logging.info(f"Удалено старое сообщение с ID: {msg_id}")
+                except Exception as e:
+                    logging.warning(f"Не удалось удалить сообщение {msg_id}: {str(e)}")
+        context.user_data['message_ids'] = [current_message_id]
+
     if user_id not in ADMIN_IDS:
         await query.message.edit_text("У вас нет прав для выполнения этой операции.")
         return
@@ -159,11 +187,14 @@ async def handle_delete_link_selection(update: Update, context: ContextTypes.DEF
             reply_markup = InlineKeyboardMarkup(keyboard)
             message = await query.message.edit_text(f"Выберите ссылку для удаления в категории '{category_map.get(category)}':",
                                                     reply_markup=reply_markup)
-            context.user_data['message_ids'].append(message.message_id)
+            context.user_data['message_ids'] = [message.message_id]
             return STATE_DELETE_LINK_SELECTION
         else:
-            message = await query.message.edit_text(f"В категории '{category_map.get(category)}' нет ссылок для удаления.")
-            context.user_data['message_ids'].append(message.message_id)
+            keyboard = [[InlineKeyboardButton("Назад", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            message = await query.message.edit_text(f"В категории '{category_map.get(category)}' нет ссылок для удаления.", reply_markup=reply_markup)
+            context.user_data['message_ids'] = [message.message_id]
+            return ConversationHandler.END
     return
 
 async def handle_delete_link_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,6 +202,23 @@ async def handle_delete_link_confirmed(update: Update, context: ContextTypes.DEF
     user_id = query.from_user.id
     logging.info(f"Удаление ссылки с ID: {query.data} пользователем {user_id}")
     await query.answer()
+    chat_id = query.message.chat_id
+
+    # Сохранение текущего message_id перед очисткой
+    current_message_id = query.message.message_id
+    context.user_data['current_message_id'] = current_message_id
+
+    # Удаление предыдущих сообщений, кроме текущего
+    if 'message_ids' in context.user_data and context.user_data['message_ids']:
+        for msg_id in context.user_data['message_ids']:
+            if msg_id != current_message_id:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                    logging.info(f"Удалено старое сообщение с ID: {msg_id}")
+                except Exception as e:
+                    logging.warning(f"Не удалось удалить сообщение {msg_id}: {str(e)}")
+        context.user_data['message_ids'] = [current_message_id]
+
     if user_id not in ADMIN_IDS:
         await query.message.edit_text("У вас нет прав для выполнения этой операции.")
         return
@@ -180,9 +228,16 @@ async def handle_delete_link_confirmed(update: Update, context: ContextTypes.DEF
         try:
             db.delete_link(link_id, category)
             message = await query.message.edit_text(f"Ссылка с ID {link_id} удалена из категории '{category_map.get(category)}'.")
-            context.user_data['message_ids'].append(message.message_id)
+            context.user_data['message_ids'] = [message.message_id]
             logging.info(f"Ссылка с ID {link_id} успешно удалена")
-            # Возврат в главное меню
+            # Удаляем все сообщения перед возвратом
+            if 'message_ids' in context.user_data and context.user_data['message_ids']:
+                for msg_id in context.user_data['message_ids']:
+                    try:
+                        await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
+                        logging.info(f"Deleted message with ID: {msg_id}")
+                    except Exception as e:
+                        logging.warning(f"Failed to delete message {msg_id}: {str(e)}")
             await handle_back(update, context)
         except Exception as e:
             logging.error(f"Ошибка при удалении ссылки с ID {link_id}: {e}")
@@ -197,13 +252,13 @@ def link_conversation_handler():
         ],
         states={
             STATE_ADDING_LINKS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),  # Только текстовые сообщения
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link),
                 CallbackQueryHandler(handle_done_link, pattern="^done_link$")
             ],
             STATE_DELETE_LINK_SELECTION: [
                 CallbackQueryHandler(handle_delete_link_confirmed, pattern="^delete_link_")
             ]
         },
-        fallbacks=[CallbackQueryHandler(handle_back, pattern="^back_to_main$")],  # Используем handle_back
+        fallbacks=[CallbackQueryHandler(handle_back, pattern="^back_to_main$")],
         allow_reentry=True
     )

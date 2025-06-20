@@ -1,6 +1,12 @@
+import os
 import sqlite3
 import base64
 import logging
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 
 class Database:
     def __init__(self, db_name="bot.db"):
@@ -13,8 +19,15 @@ class Database:
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS documents
                               (id INTEGER PRIMARY KEY AUTOINCREMENT,
                                category TEXT,
-                               file_id TEXT,
-                               file_name TEXT)''')
+                               file_name TEXT,  -- Добавляем колонку file_name
+                               file_path TEXT)''')
+        # Удаляем file_id, так как он больше не нужен
+        try:
+            self.cursor.execute("ALTER TABLE documents DROP COLUMN file_id")
+        except sqlite3.OperationalError:
+            # Игнорируем ошибку, если столбец уже удалён
+            pass
+
         # Таблица для ссылок
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS links
                               (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,19 +39,33 @@ class Database:
                               (id INTEGER PRIMARY KEY AUTOINCREMENT,
                                title TEXT NOT NULL,
                                text TEXT NOT NULL,
-                               image TEXT)''')
+                               images TEXT,
+                               category TEXT,
+                               created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         self.conn.commit()
 
-    def save_document(self, category, file_id, file_name):
-        self.cursor.execute("INSERT INTO documents (category, file_id, file_name) VALUES (?, ?, ?)",
-                           (category, file_id, file_name))
+    def save_document(self, category, file_name, file_path):
+        # Убеждаемся, что file_path валиден
+        if not os.path.exists(file_path):
+            raise ValueError(f"File path {file_path} does not exist")
+
+        # Заменяем / на _ для корректности пути в базе данных
+        safe_category = category.replace("/", "_")
+
+        # Сохраняем в базу данных
+        self.cursor.execute(
+            "INSERT INTO documents (category, file_name, file_path) VALUES (?, ?, ?)",
+            (safe_category, file_name, file_path)
+        )
         self.conn.commit()
+
+        # Получаем ID последней вставленной записи
         self.cursor.execute("SELECT last_insert_rowid()")
         return self.cursor.fetchone()[0]
 
     def get_documents(self, category, limit=None):
         try:
-            query = "SELECT id, file_id, file_name FROM documents WHERE category = ?"
+            query = "SELECT id, file_name, file_path FROM documents WHERE category = ?"
             params = [category]
             if limit:
                 query += " LIMIT ?"
@@ -80,7 +107,7 @@ class Database:
                 params.append(limit)
             self.cursor.execute(query, params)
             result = self.cursor.fetchall()
-            logging.info(f"Получено ссылок для категории {category}: {result}")  # Добавим лог
+            logging.info(f"Получено ссылок для категории {category}: {result}")
             return result
         except sqlite3.Error as e:
             logging.error(f"Ошибка при получении ссылок: {e}")
@@ -92,26 +119,78 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
-    def save_announcement(self, title, text, image=None):
-        self.cursor.execute("INSERT INTO announcements (title, text, image) VALUES (?, ?, ?)",
-                           (title, text, image))
-        self.conn.commit()
-        self.cursor.execute("SELECT last_insert_rowid()")
-        return self.cursor.fetchone()[0]
+    def save_announcement(self, title, text, images_str, category):
+        logger.info(
+            f"Сохранение объявления: title={title}, text_length={len(text) if text else 0}, images_length={len(images_str) if images_str else 0}, category={category}")
+        try:
+            self.cursor.execute('''
+                INSERT INTO announcements (title, text, images, category, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (title, text, images_str, category))
+            self.conn.commit()
+            return self.cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при сохранении в базу данных: {str(e)}")
+            raise
 
-    def get_announcements(self):
-        self.cursor.execute("SELECT id, title FROM announcements")
-        return self.cursor.fetchall()
+    def get_announcement(self, ann_id):
+        try:
+            self.cursor.execute('SELECT title, text, images, category FROM announcements WHERE id = ?', (ann_id,))
+            result = self.cursor.fetchone()
+            return result if result else None
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении объявления: {str(e)}")
+            raise
 
-    def get_announcement(self, announcement_id):
-        self.cursor.execute("SELECT title, text, image FROM announcements WHERE id = ?", (announcement_id,))
-        return self.cursor.fetchone()
+    def get_announcements(self, category):
+        try:
+            self.cursor.execute(
+                'SELECT id, title, text, images, category, created_at FROM announcements WHERE category = ?',
+                (category,))
+            results = self.cursor.fetchall()
+            return results if results else []
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении объявлений: {str(e)}")
+            raise
 
-    def delete_announcement(self, announcement_id):
-        self.cursor.execute("DELETE FROM announcements WHERE id = ?", (announcement_id,))
-        self.conn.commit()
+    def delete_announcement(self, ann_id):
+        try:
+            # Сначала получаем пути к изображениям
+            self.cursor.execute('SELECT images FROM announcements WHERE id = ?', (ann_id,))
+            result = self.cursor.fetchone()
+            if result and result[0]:
+                images_str = result[0]
+                if images_str:
+                    image_paths = images_str.split(',')
+                    for path in image_paths:
+                        if os.path.exists(path):
+                            os.remove(path)
+                            logger.info(f"Удалён файл изображения: {path}")
+            # Удаляем запись из базы
+            self.cursor.execute('DELETE FROM announcements WHERE id = ?', (ann_id,))
+            self.conn.commit()
+            logger.info(f"Объявление с ID {ann_id} удалено")
+            return self.cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при удалении объявления: {str(e)}")
+            raise
+
+    def update_announcement(self, ann_id, title, text, images_str):
+        try:
+            self.cursor.execute('''
+                UPDATE announcements
+                SET title = ?, text = ?, images = ?
+                WHERE id = ?
+            ''', (title, text, images_str, ann_id))
+            self.conn.commit()
+            logger.info(f"Объявление с ID {ann_id} обновлено")
+            return self.cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при обновлении объявления: {str(e)}")
+            raise
 
     def __del__(self):
         self.conn.close()
+
 
 db = Database()
